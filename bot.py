@@ -1,14 +1,15 @@
 import os
 import sqlite3
 import time
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")  # например: @mychannel
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
 
-ANTI_SPAM_SECONDS = 10  # можно изменить
+ANTI_SPAM_SECONDS = 10
 
 # --- БАЗА ---
 conn = sqlite3.connect("database.db", check_same_thread=False)
@@ -28,6 +29,17 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS attempts (
     user_id INTEGER PRIMARY KEY,
     last_attempt INTEGER
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS attempt_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    message TEXT,
+    is_correct INTEGER,
+    timestamp TEXT
 )
 """)
 
@@ -59,7 +71,32 @@ async def setword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """, (word,))
     conn.commit()
 
-    await update.message.reply_text(f"✅ Новое слово установлено: {word}")
+    await update.message.reply_text(f"✅ Новое слово установлено.")
+
+# --- Просмотр последних 20 попыток ---
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    cursor.execute("""
+        SELECT username, message, is_correct, timestamp
+        FROM attempt_logs
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        await update.message.reply_text("Логов пока нет.")
+        return
+
+    text = ""
+    for row in rows:
+        username, message, is_correct, timestamp = row
+        status = "✅" if is_correct else "❌"
+        text += f"{status} @{username} → {message} ({timestamp})\n"
+
+    await update.message.reply_text(text[:4000])
 
 # --- Проверка комментариев ---
 async def check_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -72,7 +109,7 @@ async def check_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверка подписки
     if not await is_subscribed(user.id, context):
         await update.message.reply_text(
-            f"❌ Чтобы участвовать, подпишитесь на {CHANNEL_USERNAME}"
+            f"❌ Подпишитесь на {CHANNEL_USERNAME}"
         )
         return
 
@@ -82,9 +119,8 @@ async def check_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = cursor.fetchone()
 
     if data:
-        last_attempt = data[0]
-        if current_time - last_attempt < ANTI_SPAM_SECONDS:
-            return  # молча игнорируем спам
+        if current_time - data[0] < ANTI_SPAM_SECONDS:
+            return
 
     cursor.execute("""
         INSERT OR REPLACE INTO attempts (user_id, last_attempt)
@@ -101,11 +137,25 @@ async def check_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     word, is_active = contest
 
+    is_correct = 1 if text == word and is_active else 0
+
+    # ЛОГИРУЕМ ВСЕ ПОПЫТКИ
+    cursor.execute("""
+        INSERT INTO attempt_logs (user_id, username, message, is_correct, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        user.id,
+        user.username or user.first_name,
+        text,
+        is_correct,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    conn.commit()
+
     if not is_active:
         return
 
     if text == word:
-        # фиксируем победителя
         cursor.execute("""
             UPDATE contest
             SET is_active = 0,
@@ -114,21 +164,20 @@ async def check_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (user.id, user.username or user.first_name))
         conn.commit()
 
-        # сообщение в комментариях
         await update.message.reply_text(
-            f"🎉 Победитель: @{user.username or user.first_name}\nКонкурс завершён!"
+            f"🎉 Победитель: @{user.username or user.first_name}"
         )
 
-        # сообщение админу
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"🏆 Победитель:\nUsername: @{user.username}\nID: {user.id}"
+            text=f"🏆 Победитель:\n@{user.username}\nID: {user.id}"
         )
 
 # --- Запуск ---
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("setword", setword))
+app.add_handler(CommandHandler("logs", logs))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_comment))
 
 app.run_polling()
