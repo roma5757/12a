@@ -1,14 +1,8 @@
 import os
 import sqlite3
 import time
-import random
-import asyncio
 from datetime import datetime
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -16,28 +10,26 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
     ContextTypes,
-    ConversationHandler
+    ConversationHandler,
 )
 
-# ================= НАСТРОЙКИ =================
-
+# ===== ПЕРЕМЕННЫЕ =====
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
-
 ANTI_SPAM_SECONDS = 10
 
-# ================= БАЗА ДАННЫХ =================
-
+# ===== БАЗА ДАННЫХ =====
 conn = sqlite3.connect("database.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Угадай слово
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS contest (
+    id INTEGER PRIMARY KEY,
     word TEXT,
     is_active INTEGER,
-    winner_id INTEGER
+    winner_id INTEGER,
+    winner_username TEXT
 )
 """)
 
@@ -48,30 +40,21 @@ CREATE TABLE IF NOT EXISTS attempts (
 )
 """)
 
-# Giveaway
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS giveaways (
+CREATE TABLE IF NOT EXISTS attempt_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER,
-    winners_count INTEGER,
-    end_time INTEGER,
-    is_active INTEGER
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS giveaway_participants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    giveaway_id INTEGER,
     user_id INTEGER,
-    username TEXT
+    username TEXT,
+    message TEXT,
+    is_correct INTEGER,
+    timestamp TEXT
 )
 """)
-
 conn.commit()
 
-# ================= ПРОВЕРКА ПОДПИСКИ =================
+# ===== ФУНКЦИИ =====
 
+# Проверка подписки (если не подписан → попытка не засчитывается)
 async def is_subscribed(user_id, context):
     try:
         member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
@@ -79,292 +62,135 @@ async def is_subscribed(user_id, context):
     except:
         return False
 
-# =====================================================
-# ================= УГАДАЙ СЛОВО =====================
-# =====================================================
-
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Админ-панель ---
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text("Введите слово для конкурса:")
-    return 1
 
-async def set_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    word = update.message.text.lower()
-    cursor.execute("DELETE FROM contest")
-    cursor.execute("INSERT INTO contest VALUES (?, 1, NULL)", (word,))
-    conn.commit()
-    await update.message.reply_text("Слово установлено.")
-    return ConversationHandler.END
+    keyboard = [
+        [InlineKeyboardButton("🟢 Начать конкурс", callback_data="start_contest")],
+        [InlineKeyboardButton("⛔ Остановить конкурс", callback_data="stop_contest")],
+        [InlineKeyboardButton("🔄 Сбросить конкурс", callback_data="reset_contest")],
+        [InlineKeyboardButton("📊 Просмотр логов", callback_data="show_logs")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Панель администратора:", reply_markup=reply_markup)
 
-async def check_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    user = update.effective_user
-    text = update.message.text.lower().strip()
-
-    if not await is_subscribed(user.id, context):
-        return
-
-    # антиспам
-    now = int(time.time())
-    cursor.execute("SELECT last_attempt FROM attempts WHERE user_id=?", (user.id,))
-    data = cursor.fetchone()
-    if data and now - data[0] < ANTI_SPAM_SECONDS:
-        return
-
-    cursor.execute("INSERT OR REPLACE INTO attempts VALUES (?,?)", (user.id, now))
-    conn.commit()
-
-    cursor.execute("SELECT word, is_active FROM contest")
-    contest = cursor.fetchone()
-    if not contest:
-        return
-
-    word, is_active = contest
-    if is_active and text == word:
-        cursor.execute("UPDATE contest SET is_active=0, winner_id=?", (user.id,))
-        conn.commit()
-
-        await update.message.reply_text(f"🎉 Победитель: @{user.username}")
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"Угадал слово: @{user.username}"
-        )
-
-# =====================================================
-# ================= GIVEAWAY ==========================
-# =====================================================
-
-PHOTO, DESC, WINNERS, TIME = range(4)
-
-async def giveaway_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    await update.message.reply_text("Отправьте фото или /skip")
-    return PHOTO
-
-async def giveaway_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["photo"] = update.message.photo[-1].file_id
-    await update.message.reply_text("Введите описание:")
-    return DESC
-
-async def giveaway_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["photo"] = None
-    await update.message.reply_text("Введите описание:")
-    return DESC
-
-async def giveaway_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["desc"] = update.message.text
-    await update.message.reply_text("Сколько победителей?")
-    return WINNERS
-
-async def giveaway_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["winners"] = int(update.message.text)
-    await update.message.reply_text("Через сколько минут завершить?")
-    return TIME
-
-async def giveaway_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    minutes = int(update.message.text)
-    end_time = int(time.time()) + minutes * 60
-
-    text = f"""
-🎁 <b>РОЗЫГРЫШ</b>
-
-{context.user_data["desc"]}
-
-🏆 Победителей: {context.user_data["winners"]}
-⏳ Итоги через {minutes} мин.
-"""
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎉 Участвовать (0)", callback_data="join")]
-    ])
-
-    if context.user_data["photo"]:
-        msg = await context.bot.send_photo(
-            CHANNEL_USERNAME,
-            context.user_data["photo"],
-            caption=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-    else:
-        msg = await context.bot.send_message(
-            CHANNEL_USERNAME,
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-
-    cursor.execute("""
-    INSERT INTO giveaways (message_id, winners_count, end_time, is_active)
-    VALUES (?, ?, ?, 1)
-    """, (msg.message_id, context.user_data["winners"], end_time))
-    conn.commit()
-
-    asyncio.create_task(finish_giveaway(context, msg.message_id))
-
-    await update.message.reply_text("Розыгрыш запущен.")
-    return ConversationHandler.END
-
-async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-
-    if not await is_subscribed(user.id, context):
-        return
-
-    cursor.execute("SELECT id FROM giveaways WHERE is_active=1")
-    g = cursor.fetchone()
-    if not g:
-        return
-
-    giveaway_id = g[0]
-
-    cursor.execute("""
-    SELECT * FROM giveaway_participants
-    WHERE giveaway_id=? AND user_id=?
-    """, (giveaway_id, user.id))
-    if cursor.fetchone():
-        return
-
-    cursor.execute("""
-    INSERT INTO giveaway_participants (giveaway_id,user_id,username)
-    VALUES (?,?,?)
-    """, (giveaway_id, user.id, user.username))
-    conn.commit()
-
-    cursor.execute("""
-    SELECT COUNT(*) FROM giveaway_participants WHERE giveaway_id=?
-    """, (giveaway_id,))
-    count = cursor.fetchone()[0]
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎉 Участвовать ({count})", callback_data="join")]
-    ])
-
-    await query.edit_message_reply_markup(reply_markup=keyboard)
-
-async def finish_giveaway(context, message_id):
-    while True:
-        cursor.execute("""
-        SELECT id, winners_count, end_time
-        FROM giveaways
-        WHERE message_id=? AND is_active=1
-        """, (message_id,))
-        data = cursor.fetchone()
-
-        if not data:
-            return
-
-        giveaway_id, winners_count, end_time = data
-
-        if int(time.time()) >= end_time:
-            cursor.execute("""
-            SELECT username FROM giveaway_participants
-            WHERE giveaway_id=?
-            """, (giveaway_id,))
-            participants = cursor.fetchall()
-
-            if not participants:
-                return
-
-            random.shuffle(participants)
-            winners = participants[:winners_count]
-
-            winners_text = "\n".join([f"@{w[0]}" for w in winners])
-
-            await context.bot.send_message(
-                CHANNEL_USERNAME,
-                f"🏆 <b>Победители:</b>\n{winners_text}",
-                parse_mode="HTML",
-                reply_to_message_id=message_id
-            )
-
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Перевыбрать", callback_data="reroll")]
-            ])
-
-            await context.bot.send_message(
-                CHANNEL_USERNAME,
-                "Перевыбрать победителей:",
-                reply_markup=keyboard
-            )
-
-            cursor.execute("UPDATE giveaways SET is_active=0 WHERE id=?", (giveaway_id,))
-            conn.commit()
-            return
-
-        await asyncio.sleep(10)
-
-async def reroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Обработка кнопок ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     if query.from_user.id != ADMIN_ID:
         return
 
-    cursor.execute("""
-    SELECT id, winners_count FROM giveaways
-    ORDER BY id DESC LIMIT 1
-    """)
-    g = cursor.fetchone()
+    if query.data == "start_contest":
+        await query.edit_message_text("Введите новое слово для конкурса:")
+        return "WAIT_WORD"
 
-    if not g:
+    elif query.data == "stop_contest":
+        cursor.execute("UPDATE contest SET is_active = 0")
+        conn.commit()
+        await query.edit_message_text("⛔ Конкурс остановлен.")
+
+    elif query.data == "reset_contest":
+        cursor.execute("DELETE FROM contest")
+        conn.commit()
+        await query.edit_message_text("🔄 Конкурс сброшен.")
+
+    elif query.data == "show_logs":
+        cursor.execute("""
+            SELECT username, message, is_correct, timestamp
+            FROM attempt_logs
+            ORDER BY id DESC
+            LIMIT 20
+        """)
+        rows = cursor.fetchall()
+        if not rows:
+            await query.edit_message_text("Логов пока нет.")
+            return
+        text = ""
+        for row in rows:
+            username, message, is_correct, timestamp = row
+            status = "✅" if is_correct else "❌"
+            text += f"{status} @{username} → {message} ({timestamp})\n"
+        await query.edit_message_text(text[:4000])
+
+# --- Ввод нового слова после кнопки ---
+async def set_new_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    word = update.message.text.lower()
+    cursor.execute("DELETE FROM contest")
+    cursor.execute(
+        "INSERT INTO contest (word, is_active, winner_id, winner_username) VALUES (?, 1, NULL, NULL)",
+        (word,)
+    )
+    conn.commit()
+    await update.message.reply_text(f"✅ Новое слово установлено: {word}")
+    return ConversationHandler.END
+
+# --- Проверка комментариев ---
+async def check_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
         return
 
-    giveaway_id, winners_count = g
+    user = update.effective_user
+    text = update.message.text.lower().strip()
 
+    # Проверка подписки (если не подписан — попытка игнорируется)
+    if not await is_subscribed(user.id, context):
+        return  # просто не засчитываем, без сообщений
+
+    # Анти-спам
+    current_time = int(time.time())
+    cursor.execute("SELECT last_attempt FROM attempts WHERE user_id = ?", (user.id,))
+    data = cursor.fetchone()
+    if data:
+        if current_time - data[0] < ANTI_SPAM_SECONDS:
+            return  # молча игнорируем спам
+    cursor.execute("INSERT OR REPLACE INTO attempts (user_id, last_attempt) VALUES (?, ?)", (user.id, current_time))
+    conn.commit()
+
+    # Проверяем конкурс
+    cursor.execute("SELECT word, is_active FROM contest")
+    contest = cursor.fetchone()
+    if not contest:
+        return
+    word, is_active = contest
+    is_correct = 1 if text == word and is_active else 0
+
+    # Логируем все попытки
     cursor.execute("""
-    SELECT username FROM giveaway_participants
-    WHERE giveaway_id=?
-    """, (giveaway_id,))
-    participants = cursor.fetchall()
+        INSERT INTO attempt_logs (user_id, username, message, is_correct, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user.id, user.username or user.first_name, text, is_correct, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
 
-    random.shuffle(participants)
-    winners = participants[:winners_count]
+    if not is_active:
+        return
 
-    winners_text = "\n".join([f"@{w[0]}" for w in winners])
+    if text == word:
+        cursor.execute("""
+            UPDATE contest
+            SET is_active = 0, winner_id = ?, winner_username = ?
+        """, (user.id, user.username or user.first_name))
+        conn.commit()
 
-    await query.message.reply_text(
-        f"🔄 <b>Новые победители:</b>\n{winners_text}",
-        parse_mode="HTML"
-    )
+        await update.message.reply_text(f"🎉 Победитель: @{user.username or user.first_name}")
 
-# ================= ЗАПУСК =================
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"🏆 Победитель:\n@{user.username}\nID: {user.id}")
 
+# ===== НАСТРОЙКА ПРИЛОЖЕНИЯ =====
 app = ApplicationBuilder().token(TOKEN).build()
 
-# угадай слово
-conv_word = ConversationHandler(
-    entry_points=[CommandHandler("admin", admin)],
-    states={1: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_word)]},
+conv_handler = ConversationHandler(
+    entry_points=[CallbackQueryHandler(button_handler, pattern="start_contest")],
+    states={"WAIT_WORD": [MessageHandler(filters.TEXT & ~filters.COMMAND, set_new_word)]},
     fallbacks=[]
 )
 
-# giveaway
-conv_give = ConversationHandler(
-    entry_points=[CommandHandler("giveaway", giveaway_start)],
-    states={
-        PHOTO: [
-            MessageHandler(filters.PHOTO, giveaway_photo),
-            CommandHandler("skip", giveaway_skip)
-        ],
-        DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, giveaway_desc)],
-        WINNERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, giveaway_winners)],
-        TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, giveaway_time)]
-    },
-    fallbacks=[]
-)
-
-app.add_handler(conv_word)
-app.add_handler(conv_give)
-app.add_handler(CallbackQueryHandler(join, pattern="join"))
-app.add_handler(CallbackQueryHandler(reroll, pattern="reroll"))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_word))
+app.add_handler(CommandHandler("admin", admin_panel))
+app.add_handler(conv_handler)
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_comment))
 
 app.run_polling()
